@@ -48,9 +48,9 @@ import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # DATA MODELS
@@ -79,6 +79,24 @@ class LatencySample:
     status_code: int
     success: bool
     error: Optional[str] = None
+
+@dataclass
+class BenchmarkComparison:
+    metric: str
+    baseline: float
+    current: float
+    absolute_change: float
+    percent_change: Optional[float]
+    direction: str
+    regression_percent: Optional[float]
+    is_regression: bool
+
+@dataclass
+class ComparisonSummary:
+    baseline_path: str
+    fail_regression_percent: Optional[float]
+    failed_regression_threshold: bool
+    comparisons: List[BenchmarkComparison]
 
 # ---------------------------------------------------------------------------
 # HTTP CLIENT
@@ -230,6 +248,160 @@ def aggregate_results(results: List[LatencySample], benchmark_type: str,
         target_endpoint=url,
         concurrency=concurrency,
     )
+
+
+def benchmark_result_to_dict(result: BenchmarkResult) -> Dict[str, Any]:
+    data = asdict(result)
+    return {
+        "schema_version": 1,
+        "benchmark_type": data["benchmark_type"],
+        "target_endpoint": data["target_endpoint"],
+        "concurrency": data["concurrency"],
+        "start_time": data["start_time"],
+        "end_time": data["end_time"],
+        "duration_seconds": data["duration_seconds"],
+        "total_requests": data["total_requests"],
+        "successful_requests": data["successful_requests"],
+        "failed_requests": data["failed_requests"],
+        "timeout_requests": data["timeout_requests"],
+        "requests_per_second": data["requests_per_second"],
+        "latency_ms": data["latency_ms"],
+        "error_distribution": data["error_distribution"],
+    }
+
+
+def write_baseline(path: str, result: BenchmarkResult):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(benchmark_result_to_dict(result), f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def load_baseline(path: str) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    required = {"benchmark_type", "requests_per_second", "latency_ms"}
+    missing = sorted(required - set(data))
+    if missing:
+        raise ValueError(f"Baseline {path} is missing required keys: {', '.join(missing)}")
+    return data
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _percent_change(baseline: float, current: float) -> Optional[float]:
+    if baseline == 0:
+        return None
+    return (current - baseline) / abs(baseline) * 100
+
+
+def _regression_percent(direction: str, baseline: float, current: float,
+                        percent_change: Optional[float]) -> Tuple[Optional[float], bool]:
+    if direction == "lower":
+        if current <= baseline:
+            return 0.0 if percent_change is not None else None, False
+        return percent_change, True
+    if direction == "higher":
+        if current >= baseline:
+            return 0.0 if percent_change is not None else None, False
+        return abs(percent_change) if percent_change is not None else None, True
+    return None, False
+
+
+def compare_results(current: BenchmarkResult, baseline: Dict[str, Any],
+                    baseline_path: str,
+                    fail_regression_percent: Optional[float] = None) -> ComparisonSummary:
+    current_data = benchmark_result_to_dict(current)
+    metric_directions = {
+        "requests_per_second": "higher",
+        "successful_requests": "higher",
+        "failed_requests": "lower",
+        "timeout_requests": "lower",
+        "duration_seconds": "lower",
+    }
+    latency_directions = {
+        f"latency_ms.{name}": "lower"
+        for name in ("min", "avg", "p50", "p90", "p95", "p99", "max", "stddev")
+    }
+    metric_directions.update(latency_directions)
+
+    comparisons: List[BenchmarkComparison] = []
+    for metric, direction in metric_directions.items():
+        if metric.startswith("latency_ms."):
+            latency_key = metric.split(".", 1)[1]
+            baseline_value = _as_float(baseline.get("latency_ms", {}).get(latency_key))
+            current_value = _as_float(current_data.get("latency_ms", {}).get(latency_key))
+        else:
+            baseline_value = _as_float(baseline.get(metric))
+            current_value = _as_float(current_data.get(metric))
+
+        if baseline_value is None or current_value is None:
+            continue
+
+        percent_change = _percent_change(baseline_value, current_value)
+        regression_percent, is_regression = _regression_percent(
+            direction, baseline_value, current_value, percent_change
+        )
+        comparisons.append(BenchmarkComparison(
+            metric=metric,
+            baseline=baseline_value,
+            current=current_value,
+            absolute_change=current_value - baseline_value,
+            percent_change=percent_change,
+            direction=direction,
+            regression_percent=regression_percent,
+            is_regression=is_regression,
+        ))
+
+    failed_threshold = False
+    if fail_regression_percent is not None:
+        for item in comparisons:
+            if not item.is_regression:
+                continue
+            if item.regression_percent is None or item.regression_percent > fail_regression_percent:
+                failed_threshold = True
+                break
+
+    return ComparisonSummary(
+        baseline_path=baseline_path,
+        fail_regression_percent=fail_regression_percent,
+        failed_regression_threshold=failed_threshold,
+        comparisons=comparisons,
+    )
+
+
+def comparison_summary_to_dict(summary: ComparisonSummary) -> Dict[str, Any]:
+    return {
+        "baseline_path": summary.baseline_path,
+        "fail_regression_percent": summary.fail_regression_percent,
+        "failed_regression_threshold": summary.failed_regression_threshold,
+        "comparisons": [asdict(item) for item in summary.comparisons],
+    }
+
+
+def print_comparison(summary: ComparisonSummary):
+    print("\nBaseline comparison")
+    print(f"  Baseline: {summary.baseline_path}")
+    print("  Metric                           Baseline      Current       Change      Change %")
+    print("  -------------------------------------------------------------------------------")
+    for item in summary.comparisons:
+        pct = "n/a" if item.percent_change is None else f"{item.percent_change:+.2f}%"
+        marker = " REGRESSION" if item.is_regression else ""
+        print(
+            f"  {item.metric:<30} "
+            f"{item.baseline:>10.2f} "
+            f"{item.current:>10.2f} "
+            f"{item.absolute_change:>+10.2f} "
+            f"{pct:>10}{marker}"
+        )
+    if summary.fail_regression_percent is not None:
+        status = "failed" if summary.failed_regression_threshold else "passed"
+        print(f"  Regression threshold {summary.fail_regression_percent:.2f}%: {status}")
 
 # ---------------------------------------------------------------------------
 # BENCHMARK FUNCTIONS
@@ -419,6 +591,10 @@ def main():
     parser.add_argument("--timeout", "-t", type=float, default=30.0,
                        help="Request timeout in seconds")
     parser.add_argument("--output", "-o", help="Save results to JSON file")
+    parser.add_argument("--baseline", help="Compare current results with a previous benchmark JSON file")
+    parser.add_argument("--write-baseline", help="Save current results as a deterministic baseline JSON file")
+    parser.add_argument("--fail-regression", type=float,
+                       help="Exit non-zero when any regression is greater than this percentage")
 
     subparsers = parser.add_subparsers(dest="mode", help="Benchmark mode")
 
@@ -472,27 +648,36 @@ def main():
 
     if result:
         print_results(result)
+        comparison = None
+        if args.baseline:
+            try:
+                baseline = load_baseline(args.baseline)
+                comparison = compare_results(
+                    result,
+                    baseline,
+                    args.baseline,
+                    args.fail_regression,
+                )
+                print_comparison(comparison)
+            except Exception as e:
+                print(f"Failed to compare baseline: {e}", file=sys.stderr)
+                return 2
+        if args.write_baseline:
+            write_baseline(args.write_baseline, result)
+            print(f"Baseline saved to {args.write_baseline}")
         if args.output:
-            with open(args.output, "w") as f:
-                json.dump({
-                    "benchmark_type": result.benchmark_type,
-                    "start_time": result.start_time,
-                    "end_time": result.end_time,
-                    "duration_seconds": result.duration_seconds,
-                    "total_requests": result.total_requests,
-                    "successful_requests": result.successful_requests,
-                    "failed_requests": result.failed_requests,
-                    "timeout_requests": result.timeout_requests,
-                    "requests_per_second": result.requests_per_second,
-                    "latency_ms": result.latency_ms,
-                    "error_distribution": result.error_distribution,
-                    "target_endpoint": result.target_endpoint,
-                    "concurrency": result.concurrency,
-                }, f, indent=2)
+            output = benchmark_result_to_dict(result)
+            if comparison:
+                output["comparison"] = comparison_summary_to_dict(comparison)
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(output, f, indent=2, sort_keys=True)
+                f.write("\n")
             print(f"Results saved to {args.output}")
+        if comparison and comparison.failed_regression_threshold:
+            return 3
 
     return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

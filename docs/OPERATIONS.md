@@ -58,6 +58,38 @@ Key metrics to monitor:
 | `goroutine_count` | Gauge | Go routine count | > 5000 | > 10000 |
 | `gc_pause_time_ms` | Histogram | GC pause time | > 100ms | > 500ms |
 
+### Local Benchmark Baseline Review
+
+Use `tools/benchmark.py` baselines when reviewing a performance-sensitive
+change locally. A baseline is a checked JSON result from a known-good run; the
+comparison mode reports absolute and percentage deltas for throughput, latency,
+request counts, failures, and timeouts.
+
+Create or refresh a baseline:
+
+```bash
+python3 tools/benchmark.py --endpoint http://localhost:8080/health \
+  --concurrency 4 \
+  --write-baseline /tmp/tot-benchmark-baseline.json \
+  latency --requests 100
+```
+
+Compare a current run against that baseline and fail on regressions above 10%:
+
+```bash
+python3 tools/benchmark.py --endpoint http://localhost:8080/health \
+  --concurrency 4 \
+  --baseline /tmp/tot-benchmark-baseline.json \
+  --fail-regression 10 \
+  --output /tmp/tot-benchmark-current.json \
+  latency --requests 100
+```
+
+For latency metrics, higher values are treated as regressions. For
+`requests_per_second` and `successful_requests`, lower values are regressions.
+The JSON output includes a `comparison` object with the same pass/fail decision
+printed in the terminal.
+
 ### Grafana Dashboards
 
 Pre-built Grafana dashboards are available:
