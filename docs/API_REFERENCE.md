@@ -15,6 +15,15 @@
 > documented in the internal wiki under "OpenAPI Migration Missing Endpoints."
 > If you encounter a 404 from an endpoint that should exist, check that list.
 >
+> OpenAPI diffs should be generated with
+> `lua tools/openapi_diff.lua --left old.yaml --right new.yaml`. Use `--json`
+> when another script consumes the result. The diff tool normalizes OpenAPI
+> object key ordering before comparing endpoints and component schemas, so
+> reordered `properties`, `required`, `tags`, and response maps do not produce
+> changes when their values are otherwise identical. Real additions, removals,
+> and value changes remain visible in both the text report and deterministic
+> JSON.
+>
 > TODO: Re-generate this reference from the current API spec and fix the
 > generation tool issues. The generation is a manual step that involves
 > running a Docker container with the spec generator. The Docker image is
