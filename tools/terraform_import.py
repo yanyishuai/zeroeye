@@ -93,6 +93,7 @@ SUPPORTED_RESOURCE_TYPES = [
 ]
 
 REQUIRED_TERRAFORM_VERSION = ">= 1.0.0"
+TERRAFORM_RESOURCE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # ---------------------------------------------------------------------------
 # DATA MODELS
@@ -115,6 +116,47 @@ class ImportResult:
     skipped_count: int = 0
     results: List[Dict[str, Any]] = field(default_factory=list)
     duration_seconds: float = 0.0
+
+
+class InvalidTerraformResourceName(ValueError):
+    pass
+
+
+def resource_label(resource: ResourceToImport) -> str:
+    return f"{resource.resource_type}.{resource.resource_name}"
+
+
+def validate_resource_name(resource: ResourceToImport) -> None:
+    name = resource.resource_name
+    if not name or not TERRAFORM_RESOURCE_NAME_RE.fullmatch(name):
+        hint = " Use underscores instead of hyphens." if "-" in name else ""
+        raise InvalidTerraformResourceName(
+            "Invalid Terraform resource name for "
+            f"{resource_label(resource)}: local names must match "
+            r"[A-Za-z_][A-Za-z0-9_]*."
+            f"{hint}"
+        )
+
+
+def terraform_address_for(resource: ResourceToImport) -> str:
+    validate_resource_name(resource)
+    address = resource_label(resource)
+    resource.terraform_address = address
+    return address
+
+
+def load_resources_from_csv(csv_path: str) -> List[ResourceToImport]:
+    resources: List[ResourceToImport] = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            resources.append(ResourceToImport(
+                resource_type=row.get("type", row.get("resource_type", "")),
+                resource_name=row.get("name", row.get("resource_name", "")),
+                resource_id=row.get("id", row.get("resource_id", "")),
+                state_file=row.get("state_file", "terraform.tfstate"),
+            ))
+    return resources
 
 # ---------------------------------------------------------------------------
 # IMPORTER
@@ -142,7 +184,18 @@ class TerraformImporter:
             return False
 
     def import_resource(self, resource: ResourceToImport) -> bool:
-        address = f"{resource.resource_type}.{resource.resource_name}"
+        try:
+            address = terraform_address_for(resource)
+        except InvalidTerraformResourceName as e:
+            logger.error(f"  ✗ {e}")
+            self.results.append({
+                "address": resource_label(resource),
+                "resource_id": resource.resource_id,
+                "status": "invalid",
+                "error": str(e),
+            })
+            return False
+
         cmd = [
             self.terraform_binary, "import",
             "-state", str(self.state_dir / resource.state_file),
@@ -208,7 +261,19 @@ class TerraformImporter:
         if dry_run:
             logger.info("DRY RUN - No resources will be imported")
             for resource in resources:
-                address = f"{resource.resource_type}.{resource.resource_name}"
+                try:
+                    address = terraform_address_for(resource)
+                except InvalidTerraformResourceName as e:
+                    logger.error(f"  ✗ {e}")
+                    import_result.results.append({
+                        "address": resource_label(resource),
+                        "resource_id": resource.resource_id,
+                        "status": "invalid",
+                        "error": str(e),
+                    })
+                    import_result.failure_count += 1
+                    continue
+
                 logger.info(f"  Would import: {address} (ID: {resource.resource_id})")
                 import_result.results.append({
                     "address": address,
@@ -260,9 +325,12 @@ class TerraformImporter:
         output_file: str = "import.sh"
     ) -> str:
         lines = ["#!/bin/bash", "# Auto-generated Terraform import script", f"# Generated: {datetime.now().isoformat()}", ""]
+        validated_resources = [
+            (resource, terraform_address_for(resource))
+            for resource in resources
+        ]
 
-        for resource in resources:
-            address = f"{resource.resource_type}.{resource.resource_name}"
+        for resource, address in validated_resources:
             lines.append(
                 f"terraform import -state={resource.state_file} {address} {resource.resource_id}"
             )
@@ -491,16 +559,7 @@ def main():
             logger.info("No unmanaged resources found")
 
     if args.csv:
-        resources_to_import = []
-        with open(args.csv, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                resources_to_import.append(ResourceToImport(
-                    resource_type=row.get("type", row.get("resource_type", "")),
-                    resource_name=row.get("name", row.get("resource_name", "")),
-                    resource_id=row.get("id", row.get("resource_id", "")),
-                    state_file=row.get("state_file", "terraform.tfstate"),
-                ))
+        resources_to_import = load_resources_from_csv(args.csv)
 
         if not resources_to_import:
             logger.error("No resources found in CSV file")
@@ -508,18 +567,22 @@ def main():
 
         logger.info(f"Loaded {len(resources_to_import)} resources from {args.csv}")
 
-        if args.generate_script:
-            importer.generate_import_script(resources_to_import, args.generate_script)
-        else:
-            result = importer.import_batch(
-                resources_to_import,
-                parallel=args.parallel,
-                max_workers=args.workers,
-                dry_run=args.dry_run,
-            )
+        try:
+            if args.generate_script:
+                importer.generate_import_script(resources_to_import, args.generate_script)
+            else:
+                result = importer.import_batch(
+                    resources_to_import,
+                    parallel=args.parallel,
+                    max_workers=args.workers,
+                    dry_run=args.dry_run,
+                )
 
-            if result.failure_count > 0:
-                return 1
+                if result.failure_count > 0:
+                    return 1
+        except InvalidTerraformResourceName as e:
+            logger.error(str(e))
+            return 1
 
     return 0
 
