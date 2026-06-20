@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import json
 import logging
 import math
@@ -205,8 +206,137 @@ class ProjectReviewReport:
     warnings: int
     info_findings: int
     suggestions: int
+    ignored_files: int = 0
+    disabled_rule_findings: int = 0
     file_results: List[FileReviewResult] = field(default_factory=list)
     summary: str = ""
+
+
+@dataclass
+class ReviewerConfig:
+    """Repository-local reviewer configuration."""
+
+    root: Path
+    ignore_patterns: List[str] = field(default_factory=list)
+    disabled_rules: Set[str] = field(default_factory=set)
+    ignored_files: int = 0
+    disabled_rule_findings: int = 0
+
+    @classmethod
+    def load(cls, review_path: Path) -> "ReviewerConfig":
+        root = cls._find_config_root(review_path)
+        config = cls(root=root)
+        config.ignore_patterns = cls._read_ignore_patterns(root / ".ai-reviewer-ignore")
+        config.disabled_rules = cls._read_disabled_rules(root / ".ai-reviewer.yml")
+        return config
+
+    @staticmethod
+    def _find_config_root(review_path: Path) -> Path:
+        start = review_path if review_path.is_dir() else review_path.parent
+        candidates = [start, *start.parents]
+        for candidate in candidates:
+            if (candidate / ".ai-reviewer-ignore").exists() or (candidate / ".ai-reviewer.yml").exists():
+                return candidate
+            if (candidate / ".git").exists():
+                return candidate
+        return Path.cwd()
+
+    @staticmethod
+    def _read_ignore_patterns(path: Path) -> List[str]:
+        if not path.exists():
+            return []
+        patterns: List[str] = []
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            patterns.append(line)
+        return patterns
+
+    @staticmethod
+    def _read_disabled_rules(path: Path) -> Set[str]:
+        if not path.exists():
+            return set()
+
+        disabled: Set[str] = set()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        in_disabled_rules = False
+
+        for raw in lines:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            if re.match(r"^(disabled_rules|disabled-rules)\s*:", stripped):
+                in_disabled_rules = True
+                _, value = stripped.split(":", 1)
+                value = value.strip()
+                if value.startswith("[") and value.endswith("]"):
+                    for item in value.strip("[]").split(","):
+                        cls_value = item.strip().strip("'\"")
+                        if cls_value:
+                            disabled.add(cls_value)
+                elif value:
+                    disabled.add(value.strip("'\""))
+                continue
+
+            if in_disabled_rules:
+                if stripped.startswith("- "):
+                    disabled.add(stripped[2:].strip().strip("'\""))
+                    continue
+                if not raw.startswith((" ", "\t")):
+                    in_disabled_rules = False
+
+        return {rule for rule in disabled if rule}
+
+    def is_ignored(self, path: Path) -> bool:
+        if not self.ignore_patterns:
+            return False
+
+        try:
+            rel = path.resolve().relative_to(self.root.resolve())
+            rel_posix = rel.as_posix()
+        except ValueError:
+            rel_posix = path.as_posix()
+
+        ignored = False
+        for pattern in self.ignore_patterns:
+            negated = pattern.startswith("!")
+            raw_pattern = pattern[1:] if negated else pattern
+            if self._matches_pattern(rel_posix, raw_pattern):
+                ignored = not negated
+        return ignored
+
+    @staticmethod
+    def _matches_pattern(rel_posix: str, pattern: str) -> bool:
+        pattern = pattern.strip()
+        if not pattern:
+            return False
+
+        anchored = pattern.startswith("/")
+        pattern = pattern.lstrip("/")
+
+        if pattern.endswith("/"):
+            prefix = pattern.rstrip("/")
+            return rel_posix == prefix or rel_posix.startswith(f"{prefix}/")
+
+        if "/" not in pattern and not anchored:
+            parts = rel_posix.split("/")
+            return any(fnmatch.fnmatch(part, pattern) for part in parts)
+
+        return fnmatch.fnmatch(rel_posix, pattern)
+
+    def filter_findings(self, findings: List[ReviewFinding]) -> List[ReviewFinding]:
+        if not self.disabled_rules:
+            return findings
+
+        kept: List[ReviewFinding] = []
+        for finding in findings:
+            if any(rule in self.disabled_rules for rule in finding.rules):
+                self.disabled_rule_findings += 1
+                continue
+            kept.append(finding)
+        return kept
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +528,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-PATH-TRAVERSAL",
                 "name": "Path Traversal",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(open|read|write|unlink|rmdir|Path::new)\s*\(\s*['\"](\.\./|/etc/|/var/)",
                 "message": "Possible path traversal vulnerability. Validate file paths.",
                 "effort": 20,
@@ -406,7 +536,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-RANDOM",
                 "name": "Insecure Random Number Generator",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(random\.randint|random\.choice|srand|rand\(\)|math\.random)",
                 "message": "Use cryptographically secure random generation for security-sensitive contexts.",
                 "effort": 10,
@@ -414,7 +544,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-INSECURE-COOKIE",
                 "name": "Insecure Cookie Configuration",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"cookie\s*[\[=]\s*.*\b(httpOnly|secure|sameSite)\b\s*[=:]\s*(false|False|None)",
                 "message": "Insecure cookie configuration. Set HttpOnly, Secure, and SameSite attributes.",
                 "effort": 10,
@@ -422,7 +552,7 @@ class SecurityAuditor:
             {
                 "id": "SEC-XXE",
                 "name": "XML External Entity (XXE)",
-                "severity": ReviewSeverity.HIGH,
+                "severity": ReviewSeverity.ERROR,
                 "pattern": r"(xml\.etree|xml_parser|parse\(|SAXParser|DocumentBuilder)",
                 "message": "Possible XXE vulnerability. Disable external entity parsing.",
                 "effort": 20,
@@ -544,11 +674,13 @@ class AiCodeReviewer:
     Generates detailed review reports with severity levels and actionable suggestions.
     """
 
-    def __init__(self):
+    def __init__(self, config: Optional[ReviewerConfig] = None, verbose: bool = False):
         self.quality_analyzer = CodeQualityAnalyzer()
         self.security_auditor = SecurityAuditor()
         self.performance_profiler = PerformanceProfiler()
         self.logger = logging.getLogger("AiCodeReviewer")
+        self.config = config
+        self.verbose = verbose
 
         if HAS_MIGRATOR:
             self.pattern_detector = PatternDetector()
@@ -560,6 +692,9 @@ class AiCodeReviewer:
         """Review a single file and return the result."""
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
+        if self.config and self.config.is_ignored(path):
+            self.config.ignored_files += 1
+            raise ValueError(f"Ignored by .ai-reviewer-ignore: {path}")
 
         source = path.read_text(encoding="utf-8", errors="replace")
         language = path.suffix.lstrip(".")
@@ -676,6 +811,9 @@ class AiCodeReviewer:
                 self.logger.warning(f"Pattern detection failed: {e}")
 
         # Sort findings by severity
+        if self.config:
+            result.findings = self.config.filter_findings(result.findings)
+
         severity_order = {
             ReviewSeverity.CRITICAL: 0,
             ReviewSeverity.ERROR: 1,
@@ -732,6 +870,11 @@ class AiCodeReviewer:
             )
         ]
 
+        if self.config:
+            before_ignore = len(files)
+            files = [f for f in files if not self.config.is_ignored(f)]
+            self.config.ignored_files += before_ignore - len(files)
+
         report.total_files = len(files)
         self.logger.info(f"Found {len(files)} files to review")
 
@@ -766,6 +909,15 @@ class AiCodeReviewer:
             f"Average maintainability: {avg_maintainability:.1f}/100. "
             f"Average tech debt: {avg_debt:.1f}%."
         )
+        if self.config:
+            report.ignored_files = self.config.ignored_files
+            report.disabled_rule_findings = self.config.disabled_rule_findings
+            if self.verbose:
+                self.logger.info(
+                    "Reviewer config excluded %d path(s) and disabled %d finding(s) by rule",
+                    self.config.ignored_files,
+                    self.config.disabled_rule_findings,
+                )
 
         return report
 
@@ -795,6 +947,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path", type=str, required=True, help="File or directory to review")
     parser.add_argument("--recursive", action="store_true", help="Review directories recursively")
     parser.add_argument("--output", type=str, default=None, help="Output JSON report path")
+    parser.add_argument("--verbose", action="store_true", help="Print reviewer config ignore/disable counts")
     return parser
 
 
@@ -802,11 +955,18 @@ def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
 
-    reviewer = AiCodeReviewer()
     path = Path(args.path)
+    config = ReviewerConfig.load(path)
+    reviewer = AiCodeReviewer(config=config, verbose=args.verbose)
 
     if path.is_file():
-        result = reviewer.review_file(path)
+        try:
+            result = reviewer.review_file(path)
+        except ValueError as exc:
+            if args.verbose:
+                logger.info("%s", exc)
+                logger.info("Reviewer config excluded 1 path(s) and disabled 0 finding(s) by rule")
+            return 0
         print(f"\n{'='*60}")
         print(f"AI Code Review: {path}")
         print(f"{'='*60}")
@@ -834,6 +994,8 @@ def main() -> int:
             if f.suggestion:
                 print(f"     💡 {f.suggestion}")
         print()
+        if args.verbose:
+            print(f"Config exclusions: ignored_paths={config.ignored_files}, disabled_rule_findings={config.disabled_rule_findings}")
 
     elif path.is_dir():
         report = reviewer.review_directory(path, args.recursive)
@@ -847,6 +1009,10 @@ def main() -> int:
         print(f"  🟡 Warnings: {report.warnings}")
         print(f"  🔵 Info: {report.info_findings}")
         print(f"  💡 Suggestions: {report.suggestions}")
+        if args.verbose:
+            print(f"\nConfig exclusions:")
+            print(f"  Ignored paths: {report.ignored_files}")
+            print(f"  Disabled rule findings: {report.disabled_rule_findings}")
         print()
 
         if args.output:

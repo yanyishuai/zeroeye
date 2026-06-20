@@ -15,6 +15,46 @@
 
 ## Monitoring
 
+### AI Reviewer Configuration
+
+`tools/ai_reviewer.py` reads optional repository-local configuration before
+reviewing files. This lets operators keep generated files, vendored code, and
+known noisy rules out of project review totals without changing the reviewer
+itself.
+
+Path ignores live in `.ai-reviewer-ignore` and use gitignore-style patterns:
+
+```gitignore
+# Generated API clients
+frontend/src/generated/
+
+# Vendored SDKs
+vendor/
+*.vendor.py
+
+# Re-include a generated fixture when it should still be reviewed
+!frontend/src/generated/fixture.py
+```
+
+Rule disables live in `.ai-reviewer.yml`:
+
+```yaml
+disabled_rules:
+  - SEC-HARDCODED-KEY
+  - STYLE-LINE-LENGTH
+```
+
+Run with `--verbose` to print how many paths and findings were excluded:
+
+```bash
+python3 tools/ai_reviewer.py --path . --recursive --verbose
+python3 tools/ai_reviewer.py --path . --recursive --output review.json --verbose
+```
+
+Ignored files are removed before project totals are computed. Disabled rules
+are applied after a file is reviewed, so the report keeps accurate file counts
+while omitting findings whose rule IDs are listed in `.ai-reviewer.yml`.
+
 ### Health Check Endpoints
 
 Each service exposes a health check endpoint:
