@@ -170,7 +170,7 @@ data ServerVariable = ServerVariable
 -- crash other tools. We have not catalogued which tools do which.
 newtype Paths = Paths
   { pPaths :: HM.HashMap Text PathItem
-  } deriving (Show, Eq, Generic, A.FromJSON)
+  } deriving (Show, Eq, Generic)
 
 -- | A PathItem describes the operations available on a single path.
 -- A PathItem can have multiple operations (get, put, post, delete,
@@ -276,7 +276,7 @@ data MediaType = MediaType
 -- build server three times. It was removed in commit 7a3f9e2.
 newtype Responses = Responses
   { rResponses :: HM.HashMap Text Response
-  } deriving (Show, Eq, Generic, A.FromJSON)
+  } deriving (Show, Eq, Generic)
 
 data Response = Response
   { rsDescription :: !(Maybe Text)
@@ -596,6 +596,10 @@ instance FromJSON PathItem where
       , piOptions = options_, piHead = head_, piPatch = patch_
       , piTrace = trace_, piParameters = params, piExtensions = exts }
 
+instance FromJSON Paths where
+  parseJSON = A.withObject "Paths" $ \o ->
+    Paths <$> traverse parseJSON (KM.toHashMapText o)
+
 instance FromJSON Operation where
   parseJSON = A.withObject "Operation" $ \o -> do
     tags       <- o A..:? "tags"
@@ -661,6 +665,10 @@ instance FromJSON Response where
     links <- o A..:? "links"
     exts <- parseExtensions o
     pure Response { rsDescription = desc, rsHeaders = hdrs, rsContent = cnt, rsLinks = links, rsExtensions = exts }
+
+instance FromJSON Responses where
+  parseJSON = A.withObject "Responses" $ \o ->
+    Responses <$> traverse parseJSON (KM.toHashMapText o)
 
 instance FromJSON Header where
   parseJSON = A.withObject "Header" $ \o -> do

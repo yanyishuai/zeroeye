@@ -38,7 +38,8 @@ import qualified Data.Aeson as A
 import Control.Monad (forM_, when, unless, void)
 import Data.Bool (bool)
 import Data.Function (on)
-import Data.List (groupBy, sortBy, intercalate)
+import Data.List (groupBy, sortBy, intercalate, nub)
+import qualified Data.Vector as V
 
 -- =============================================================================
 -- The Validator Monad
@@ -123,6 +124,7 @@ validateOpenApi spec = do
         , checkCircularRefs spec
         , checkServerUrls spec
         , checkSecurityReferences spec
+        , checkSchemaEnums spec
         , checkExampleTypes spec
         , checkDeprecationConsistency spec
         , checkBrewEndpoints spec
@@ -231,6 +233,197 @@ checkSecurityReferences spec =
               ("Security requirement references undefined scheme(s): " <> T.pack missing)
               Error (Just "Define the referenced scheme in components/securitySchemes"))
       undefinedRefs
+
+checkSchemaEnums :: OpenApi -> [ValidationError]
+checkSchemaEnums spec =
+  concatMap (uncurry validateSchemaEnum) (collectSchemas spec)
+
+validateSchemaEnum :: Text -> Schema -> [ValidationError]
+validateSchemaEnum path schema =
+  let ownErrors = case scEnum schema of
+        Nothing -> []
+        Just values -> validateEnumValues path values
+      nestedErrors =
+        concat
+          [ nestedList "allOf" (scAllOf schema)
+          , nestedList "oneOf" (scOneOf schema)
+          , nestedList "anyOf" (scAnyOf schema)
+          , nestedMaybe "not" (scNot schema)
+          , nestedMaybe "if" (scIf schema)
+          , nestedMaybe "then" (scThen schema)
+          , nestedMaybe "else" (scElse schema)
+          , nestedMaybe "items" (scItems schema)
+          , nestedProperties (scProperties schema)
+          , nestedMaybe "additionalProperties" (scAdditionalProperties schema)
+          ]
+  in ownErrors ++ nestedErrors
+  where
+    nestedMaybe segment maybeSchema =
+      maybe [] (validateSchemaEnum (path <> "/" <> segment)) maybeSchema
+
+    nestedList segment maybeSchemas =
+      concat . zipWith (\idx -> validateSchemaEnum (path <> "/" <> segment <> "/" <> T.pack (show idx))) [0 :: Int ..]
+        $ fromMaybe [] maybeSchemas
+
+    nestedProperties maybeProperties =
+      concatMap (\(name, child) -> validateSchemaEnum (path <> "/properties/" <> name) child)
+        . HM.toList
+        $ fromMaybe HM.empty maybeProperties
+
+validateEnumValues :: Text -> [A.Value] -> [ValidationError]
+validateEnumValues path values =
+  let emptyErrors =
+        [ mkErr path "Enum arrays must contain at least one value"
+                Error (Just "Remove the enum field or add at least one scalar value")
+        | null values
+        ]
+      unsupportedErrors =
+        [ mkErr (path <> "/enum/" <> T.pack (show idx))
+                ("Unsupported enum value type: " <> enumValueKind value)
+                Error (Just "Enums may only contain scalar string, number, boolean, or null values")
+        | (idx, value) <- zip [0 :: Int ..] values
+        , not (isScalarEnumValue value)
+        ]
+      duplicateErrors =
+        [ mkErr path
+                ("Duplicate enum value: " <> value)
+                Error (Just "Enum values must be unique after JSON scalar normalization")
+        | value <- duplicateEnumValues values
+        ]
+  in emptyErrors ++ unsupportedErrors ++ duplicateErrors
+
+isScalarEnumValue :: A.Value -> Bool
+isScalarEnumValue (A.Object _) = False
+isScalarEnumValue (A.Array _)  = False
+isScalarEnumValue _            = True
+
+enumValueKind :: A.Value -> Text
+enumValueKind (A.Object _) = "object"
+enumValueKind (A.Array _)  = "array"
+enumValueKind (A.String _) = "string"
+enumValueKind (A.Number _) = "number"
+enumValueKind (A.Bool _)   = "boolean"
+enumValueKind A.Null       = "null"
+
+duplicateEnumValues :: [A.Value] -> [Text]
+duplicateEnumValues values =
+  let scalarValues = filter isScalarEnumValue values
+      normalized = sortBy compare (map normalizeEnumValue scalarValues)
+      grouped = filter ((> 1) . length) (groupBy (==) normalized)
+  in nub (map head grouped)
+
+normalizeEnumValue :: A.Value -> Text
+normalizeEnumValue (A.String value) = "string:" <> value
+normalizeEnumValue (A.Number value) = "number:" <> T.pack (show value)
+normalizeEnumValue (A.Bool True)    = "boolean:true"
+normalizeEnumValue (A.Bool False)   = "boolean:false"
+normalizeEnumValue A.Null           = "null"
+normalizeEnumValue value            = "unsupported:" <> enumValueKind value
+
+collectSchemas :: OpenApi -> [(Text, Schema)]
+collectSchemas spec =
+  collectComponentSchemas spec
+    ++ collectPathSchemas spec
+
+collectComponentSchemas :: OpenApi -> [(Text, Schema)]
+collectComponentSchemas spec =
+  let components = oaComponents spec
+      schemas = components >>= cmpSchemas
+      parameters = components >>= cmpParameters
+      headers = components >>= cmpHeaders
+      responses = components >>= cmpResponses
+      requestBodies = components >>= cmpRequestBodies
+  in concat
+      [ [ ("components/schemas/" <> name, schema)
+        | (name, schema) <- HM.toList (fromMaybe HM.empty schemas)
+        ]
+      , [ ("components/parameters/" <> name <> "/schema", schema)
+        | (name, parameter) <- HM.toList (fromMaybe HM.empty parameters)
+        , schema <- catMaybes [pSchema parameter]
+        ]
+      , [ ("components/headers/" <> name <> "/schema", schema)
+        | (name, header) <- HM.toList (fromMaybe HM.empty headers)
+        , schema <- catMaybes [hSchema header]
+        ]
+      , concat
+        [ collectResponseSchemas ("components/responses/" <> name) response
+        | (name, response) <- HM.toList (fromMaybe HM.empty responses)
+        ]
+      , concat
+        [ collectRequestBodySchemas ("components/requestBodies/" <> name) body
+        | (name, body) <- HM.toList (fromMaybe HM.empty requestBodies)
+        ]
+      ]
+
+collectPathSchemas :: OpenApi -> [(Text, Schema)]
+collectPathSchemas spec =
+  let paths = case oaPaths spec of
+        Nothing -> HM.empty
+        Just (Paths pathMap) -> pathMap
+  in concat
+      [ collectPathItemSchemas ("paths/" <> path) item
+      | (path, item) <- HM.toList paths
+      ]
+
+collectPathItemSchemas :: Text -> PathItem -> [(Text, Schema)]
+collectPathItemSchemas path item =
+  collectParameters (path <> "/parameters") (fromMaybe [] (piParameters item))
+    ++ collectOperationSchemas (path <> "/get") (piGet item)
+    ++ collectOperationSchemas (path <> "/put") (piPut item)
+    ++ collectOperationSchemas (path <> "/post") (piPost item)
+    ++ collectOperationSchemas (path <> "/delete") (piDelete item)
+    ++ collectOperationSchemas (path <> "/options") (piOptions item)
+    ++ collectOperationSchemas (path <> "/head") (piHead item)
+    ++ collectOperationSchemas (path <> "/patch") (piPatch item)
+    ++ collectOperationSchemas (path <> "/trace") (piTrace item)
+
+collectOperationSchemas :: Text -> Maybe Operation -> [(Text, Schema)]
+collectOperationSchemas _ Nothing = []
+collectOperationSchemas path (Just operation) =
+  collectParameters (path <> "/parameters") (fromMaybe [] (opParameters operation))
+    ++ maybe [] (collectRequestBodySchemas (path <> "/requestBody")) (opRequestBody operation)
+    ++ maybe [] (collectResponsesSchemas (path <> "/responses")) (opResponses operation)
+
+collectParameters :: Text -> [Parameter] -> [(Text, Schema)]
+collectParameters path parameters =
+  [ (path <> "/" <> parameterName parameter <> "/schema", schema)
+  | parameter <- parameters
+  , schema <- catMaybes [pSchema parameter]
+  ]
+
+parameterName :: Parameter -> Text
+parameterName parameter =
+  fromMaybe "(unnamed)" (pName parameter)
+
+collectResponsesSchemas :: Text -> Responses -> [(Text, Schema)]
+collectResponsesSchemas path (Responses responses) =
+  concat
+    [ collectResponseSchemas (path <> "/" <> status) response
+    | (status, response) <- HM.toList responses
+    ]
+
+collectResponseSchemas :: Text -> Response -> [(Text, Schema)]
+collectResponseSchemas path response =
+  let content = fromMaybe HM.empty (rsContent response)
+      headers = fromMaybe HM.empty (rsHeaders response)
+  in concat
+      [ collectContentSchemas (path <> "/content") content
+      , [ (path <> "/headers/" <> name <> "/schema", schema)
+        | (name, header) <- HM.toList headers
+        , schema <- catMaybes [hSchema header]
+        ]
+      ]
+
+collectRequestBodySchemas :: Text -> RequestBody -> [(Text, Schema)]
+collectRequestBodySchemas path body =
+  collectContentSchemas (path <> "/content") (rbContent body)
+
+collectContentSchemas :: Text -> HM.HashMap Text MediaType -> [(Text, Schema)]
+collectContentSchemas path content =
+  [ (path <> "/" <> mediaType <> "/schema", schema)
+  | (mediaType, media) <- HM.toList content
+  , schema <- catMaybes [mtSchema media]
+  ]
 
 checkExampleTypes :: OpenApi -> [ValidationError]
 checkExampleTypes spec =

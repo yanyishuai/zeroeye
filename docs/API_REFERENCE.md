@@ -22,6 +22,20 @@
 > requires authentication. The credentials are in the shared team vault.
 > The vault path is `secret/team/api-spec-generator`.
 
+## OpenAPI Enum Validation
+
+The Haskell OpenAPI validator now checks enum definitions in
+`docs/openapi/v3.yaml` before the reference server accepts the spec.
+Enum arrays must be non-empty, deterministic, and contain unique scalar
+values only. Supported enum values are strings, numbers, booleans, and
+`null`. Object or array enum values are rejected with an explicit validation
+error because the downstream generators do not have a stable representation
+for complex enum members.
+
+Enum validation covers component schemas, request and response media schemas,
+parameters, headers, and nested schemas under `allOf`, `oneOf`, `anyOf`,
+`items`, `properties`, and `additionalProperties`.
+
 ## Base URL
 
 All API endpoints are relative to:
