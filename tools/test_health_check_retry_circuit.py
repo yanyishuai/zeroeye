@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import unittest
+from typing import ClassVar
 
 import health_check
 
@@ -15,8 +16,8 @@ class FakeResponse:
 
 
 class SequencedConnection:
-    outcomes = []
-    calls = 0
+    outcomes: ClassVar[list] = []
+    calls: ClassVar[int] = 0
 
     def __init__(self, host, port, timeout):
         self.host = host
@@ -121,6 +122,22 @@ class HealthCheckRetryCircuitTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Circuit open", detail)
         self.assertEqual(SequencedConnection.calls, 0)
+
+    def test_warning_response_does_not_open_circuit(self):
+        breaker = health_check.CircuitBreaker(threshold=1, cooldown_seconds=30)
+        SequencedConnection.reset([FakeResponse(404, "missing")])
+
+        status, detail, code = health_check.check_http_service(
+            "svc", 8080, "/health", 1,
+            circuit_breaker=breaker,
+            connection_factory=SequencedConnection,
+        )
+
+        self.assertEqual(status, "WARNING")
+        self.assertEqual(code, 404)
+        self.assertIn("HTTP 404", detail)
+        self.assertEqual(breaker.failure_count, 0)
+        self.assertFalse(breaker.is_open())
 
     def test_circuit_resets_after_cooldown(self):
         breaker = health_check.CircuitBreaker(threshold=1, cooldown_seconds=1)

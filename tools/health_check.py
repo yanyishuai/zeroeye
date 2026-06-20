@@ -109,13 +109,13 @@ def probe_http_once(
     timeout: int,
     connection_factory: Callable[..., Any] = http.client.HTTPConnection,
 ) -> Tuple[str, str, int]:
+    conn = None
     try:
         conn = connection_factory(host, port, timeout=timeout)
         conn.request("GET", path)
         resp = conn.getresponse()
         status = resp.status
         body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
 
         if status == 200:
             result = "OK"
@@ -130,6 +130,12 @@ def probe_http_once(
         return result, detail, status
     except Exception as e:
         return "CRITICAL", str(e), 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def check_http_service(
@@ -171,13 +177,14 @@ def check_http_service(
             return last_status, last_detail, last_code
 
         should_retry = last_status == "CRITICAL" and attempt < attempts - 1
-        breaker.record_failure()
-        if breaker.is_open():
-            logger.warning(
-                "Circuit opened for %s:%s%s after %s consecutive failures",
-                host, port, path, breaker.failure_count,
-            )
-            return "CRITICAL", f"Circuit open: {last_detail}", last_code
+        if last_status == "CRITICAL":
+            breaker.record_failure()
+            if breaker.is_open():
+                logger.warning(
+                    "Circuit opened for %s:%s%s after %s consecutive failures",
+                    host, port, path, breaker.failure_count,
+                )
+                return "CRITICAL", f"Circuit open: {last_detail}", last_code
 
         if not should_retry:
             break
