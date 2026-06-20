@@ -37,6 +37,46 @@ The health check returns a 200 OK response with a JSON body:
 }
 ```
 
+### Health Check Retry And Circuit Breaker
+
+`tools/health_check.py` supports opt-in retry and circuit breaker controls for
+HTTP health probes. Defaults preserve the legacy single-attempt behavior.
+
+Example:
+
+```bash
+python3 tools/health_check.py \
+  --max-retries 2 \
+  --backoff-factor 2 \
+  --retry-base-delay 0.25 \
+  --circuit-threshold 3 \
+  --circuit-cooldown 30
+```
+
+Retry delay is calculated as:
+
+```text
+delay = retry_base_delay * (backoff_factor ^ attempt)
+```
+
+The circuit breaker opens after the configured number of consecutive HTTP probe
+failures and skips additional HTTP probes until the cooldown expires. This keeps
+manual checks and watch-mode monitoring from hammering services that are already
+failing. Degraded retries are logged at `WARNING` level, and reports include a
+summary count of OK, WARNING, and CRITICAL checks.
+
+For JSON output:
+
+```bash
+python3 tools/health_check.py --json --max-retries 2 --circuit-threshold 3
+```
+
+For continuous monitoring:
+
+```bash
+python3 tools/health_check.py --watch --interval 30 --max-retries 2 --circuit-threshold 3
+```
+
 ### Prometheus Metrics
 
 Each service exposes Prometheus metrics at `/metrics` on the same port as the
