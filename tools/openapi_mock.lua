@@ -49,6 +49,11 @@ local CYAN = "\27[36m"
 local MAGENTA = "\27[35m"
 local RESET = "\27[0m"
 
+local handle_request
+local send_response
+local send_error
+local get_available_endpoints
+
 -- =============================================================================
 -- Mock Response Data
 -- =============================================================================
@@ -90,6 +95,8 @@ local MOCK_RESPONSES = {
         body = {
           access_token = "mock_jwt_new_" .. generate_token_suffix(),
           refresh_token = "mock_refresh_new_" .. generate_token_suffix(),
+          expires_in = 3600,
+          token_type = "Bearer",
           user = { id = "usr_" .. generate_hex_id(), email = "new@mock-api.example.com" }
         }
       }
@@ -221,6 +228,372 @@ MOCK_RESPONSES["/api/v2/users/migrate"] = {
 -- socket that reads HTTP requests and returns JSON responses. It handles
 -- exactly one request at a time. Elena calls this "intimate hosting."
 
+local function trim(value)
+  return (value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function strip_quotes(value)
+  value = trim(value)
+  if (value:sub(1, 1) == '"' and value:sub(-1) == '"') or
+      (value:sub(1, 1) == "'" and value:sub(-1) == "'") then
+    return value:sub(2, -2)
+  end
+  return value
+end
+
+local function line_indent(line)
+  return #(line:match("^(%s*)") or "")
+end
+
+local function is_ignored_yaml_line(line)
+  return line:match("^%s*$") or line:match("^%s*#")
+end
+
+local function read_lines(path)
+  local file, err = io.open(path, "r")
+  if not file then
+    return nil, err
+  end
+  local lines = {}
+  for line in file:lines() do
+    table.insert(lines, line)
+  end
+  file:close()
+  return lines
+end
+
+local function parse_inline_enum(value)
+  local enum = {}
+  local inner = value:match("^%[(.*)%]$")
+  if not inner then
+    return enum
+  end
+  for item in inner:gmatch("[^,]+") do
+    table.insert(enum, strip_quotes(item))
+  end
+  return enum
+end
+
+local function parse_schema_block(lines, start_index, parent_indent)
+  local schema = {}
+  local index = start_index
+
+  while index <= #lines do
+    local line = lines[index]
+    if is_ignored_yaml_line(line) then
+      index = index + 1
+    else
+      local indent = line_indent(line)
+      if indent <= parent_indent then
+        break
+      end
+
+      local key, value = line:match("^%s*([%w_%-%$]+):%s*(.*)$")
+      if not key then
+        break
+      end
+
+      value = strip_quotes(value)
+      if key == "$ref" then
+        schema.ref = value
+        index = index + 1
+      elseif key == "type" then
+        schema.type = value
+        index = index + 1
+      elseif key == "enum" then
+        schema.enum = parse_inline_enum(value)
+        index = index + 1
+        if #schema.enum == 0 then
+          while index <= #lines do
+            local enum_line = lines[index]
+            if is_ignored_yaml_line(enum_line) then
+              index = index + 1
+            elseif line_indent(enum_line) > indent then
+              local item = enum_line:match("^%s*%-%s*(.+)$")
+              if item then
+                table.insert(schema.enum, strip_quotes(item))
+                index = index + 1
+              else
+                break
+              end
+            else
+              break
+            end
+          end
+        end
+      elseif key == "required" then
+        schema.required = {}
+        index = index + 1
+        while index <= #lines do
+          local req_line = lines[index]
+          if is_ignored_yaml_line(req_line) then
+            index = index + 1
+          elseif line_indent(req_line) > indent then
+            local item = req_line:match("^%s*%-%s*([%w_%-]+)")
+            if item then
+              table.insert(schema.required, item)
+              index = index + 1
+            else
+              break
+            end
+          else
+            break
+          end
+        end
+      elseif key == "properties" then
+        schema.properties = {}
+        index = index + 1
+        while index <= #lines do
+          local prop_line = lines[index]
+          if is_ignored_yaml_line(prop_line) then
+            index = index + 1
+          elseif line_indent(prop_line) > indent then
+            local prop_indent = line_indent(prop_line)
+            local prop_name = prop_line:match("^%s*([%w_%-]+):%s*$")
+            if not prop_name then
+              break
+            end
+            schema.properties[prop_name], index = parse_schema_block(lines, index + 1, prop_indent)
+          else
+            break
+          end
+        end
+      elseif key == "items" then
+        schema.items, index = parse_schema_block(lines, index + 1, indent)
+      else
+        index = index + 1
+      end
+    end
+  end
+
+  return schema, index
+end
+
+local function parse_components(lines)
+  local components = {}
+  local in_schemas = false
+  local index = 1
+
+  while index <= #lines do
+    local line = lines[index]
+    if line:match("^%s*schemas:%s*$") and line_indent(line) == 2 then
+      in_schemas = true
+      index = index + 1
+    elseif in_schemas then
+      local name = line:match("^%s%s%s%s([%w_%-]+):%s*$")
+      if name then
+        components[name], index = parse_schema_block(lines, index + 1, 4)
+      elseif line:match("^%S") then
+        break
+      else
+        index = index + 1
+      end
+    else
+      index = index + 1
+    end
+  end
+
+  return components
+end
+
+local function find_response_schema(lines, endpoint, status)
+  local endpoint_pattern = "^%s%s" .. endpoint:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1") .. ":%s*$"
+  local index = 1
+
+  while index <= #lines do
+    if lines[index]:match(endpoint_pattern) then
+      local endpoint_start = index
+      index = index + 1
+      while index <= #lines and not lines[index]:match("^%s%s/") do
+        local status_key = tostring(status)
+        local status_indent = line_indent(lines[index])
+        if status_indent >= 8 and lines[index]:match("^%s*['\"]?" .. status_key .. "['\"]?:%s*$") then
+          local response_index = index + 1
+          while response_index <= #lines and line_indent(lines[response_index]) > status_indent do
+            local content_indent = line_indent(lines[response_index])
+            if lines[response_index]:match("^%s*content:%s*$") then
+              local media_index = response_index + 1
+              while media_index <= #lines and line_indent(lines[media_index]) > content_indent do
+                local media_indent = line_indent(lines[media_index])
+                if lines[media_index]:match("^%s*application/json:%s*$") then
+                  local schema_index = media_index + 1
+                  while schema_index <= #lines and line_indent(lines[schema_index]) > media_indent do
+                    local schema_indent = line_indent(lines[schema_index])
+                    if lines[schema_index]:match("^%s*schema:%s*$") then
+                      return parse_schema_block(lines, schema_index + 1, schema_indent)
+                    end
+                    schema_index = schema_index + 1
+                  end
+                end
+                media_index = media_index + 1
+              end
+            end
+            response_index = response_index + 1
+          end
+        end
+        index = index + 1
+      end
+      index = endpoint_start + 1
+    else
+      index = index + 1
+    end
+  end
+
+  return nil
+end
+
+local function schema_ref_name(ref)
+  return ref and ref:match("#/components/schemas/([%w_%-]+)")
+end
+
+local function resolve_schema(schema, components)
+  local seen = {}
+  while schema and schema.ref do
+    local name = schema_ref_name(schema.ref)
+    if not name or seen[name] then
+      return schema
+    end
+    seen[name] = true
+    schema = components[name] or schema
+  end
+  return schema
+end
+
+local function validate_value(value, schema, components, path, errors)
+  schema = resolve_schema(schema, components)
+  if not schema then
+    return
+  end
+
+  local expected_type = schema.type
+  if not expected_type and schema.properties then
+    expected_type = "object"
+  end
+
+  if expected_type == "object" then
+    if type(value) ~= "table" or #value > 0 then
+      table.insert(errors, path .. " expected object")
+      return
+    end
+    for _, field in ipairs(schema.required or {}) do
+      if value[field] == nil then
+        table.insert(errors, path .. "." .. field .. " is required")
+      end
+    end
+    for field, child_schema in pairs(schema.properties or {}) do
+      if value[field] ~= nil then
+        validate_value(value[field], child_schema, components, path .. "." .. field, errors)
+      end
+    end
+  elseif expected_type == "array" then
+    if type(value) ~= "table" or (#value == 0 and next(value) ~= nil) then
+      table.insert(errors, path .. " expected array")
+      return
+    end
+    for i, item in ipairs(value) do
+      validate_value(item, schema.items, components, path .. "[" .. i .. "]", errors)
+    end
+  elseif expected_type == "string" then
+    if type(value) ~= "string" then
+      table.insert(errors, path .. " expected string")
+    end
+  elseif expected_type == "integer" then
+    if type(value) ~= "number" or math.floor(value) ~= value then
+      table.insert(errors, path .. " expected integer")
+    end
+  elseif expected_type == "number" then
+    if type(value) ~= "number" then
+      table.insert(errors, path .. " expected number")
+    end
+  elseif expected_type == "boolean" then
+    if type(value) ~= "boolean" then
+      table.insert(errors, path .. " expected boolean")
+    end
+  end
+
+  if schema.enum and #schema.enum > 0 and value ~= nil then
+    local matched = false
+    for _, allowed in ipairs(schema.enum) do
+      if tostring(value) == allowed then
+        matched = true
+        break
+      end
+    end
+    if not matched then
+      table.insert(errors, path .. " value '" .. tostring(value) .. "' is not in enum")
+    end
+  end
+end
+
+local function validate_mock_responses(spec_path, mock_responses)
+  local lines, err = read_lines(spec_path)
+  if not lines then
+    return {
+      ok = false,
+      validated = 0,
+      skipped = 0,
+      errors = {"cannot read OpenAPI spec " .. spec_path .. ": " .. tostring(err)}
+    }
+  end
+
+  local components = parse_components(lines)
+  local report = { ok = true, validated = 0, skipped = 0, errors = {}, skipped_endpoints = {} }
+
+  for endpoint, mock in pairs(mock_responses) do
+    local response = mock.default()
+    local content_type = response.headers and response.headers["Content-Type"] or ""
+    local schema = nil
+    if content_type:match("application/json") then
+      schema = find_response_schema(lines, endpoint, response.status)
+    end
+
+    if schema then
+      report.validated = report.validated + 1
+      validate_value(response.body, schema, components, endpoint .. " " .. tostring(response.status), report.errors)
+    else
+      report.skipped = report.skipped + 1
+      table.insert(report.skipped_endpoints, endpoint .. " " .. tostring(response.status))
+    end
+  end
+
+  table.sort(report.errors)
+  table.sort(report.skipped_endpoints)
+  report.ok = #report.errors == 0
+  return report
+end
+
+local function print_validation_report(report, allow_invalid)
+  print(CYAN .. "[MockServer] OpenAPI mock contract validation" .. RESET)
+  print(GREEN .. "[MockServer] Validated endpoints: " .. tostring(report.validated) .. RESET)
+  print(YELLOW .. "[MockServer] Skipped endpoints: " .. tostring(report.skipped) .. RESET)
+  for _, endpoint in ipairs(report.skipped_endpoints or {}) do
+    print(YELLOW .. "[MockServer]   skipped " .. endpoint .. RESET)
+  end
+  if report.ok then
+    print(GREEN .. "[MockServer] Mock responses satisfy their OpenAPI response schemas." .. RESET)
+  else
+    print(RED .. "[MockServer] Mock response contract violations:" .. RESET)
+    for _, err in ipairs(report.errors) do
+      print(RED .. "[MockServer]   " .. err .. RESET)
+    end
+    if allow_invalid then
+      print(YELLOW .. "[MockServer] Continuing because --allow-invalid-mocks was provided." .. RESET)
+    end
+  end
+end
+
+local function parse_args(args)
+  local parsed = { validate_only = false, allow_invalid_mocks = false }
+  for _, arg in ipairs(args or {}) do
+    if arg == "--validate-mocks" then
+      parsed.validate_only = true
+    elseif arg == "--allow-invalid-mocks" then
+      parsed.allow_invalid_mocks = true
+    end
+  end
+  return parsed
+end
+
 local function start_mock_server()
   local socket = require("socket")
   local server = socket.tcp()
@@ -285,7 +658,7 @@ local function start_mock_server()
   end
 end
 
-local function handle_request(method, path)
+handle_request = function(method, path)
   -- Strip query parameters. Elena doesn't parse them. They are "ambient context."
   local clean_path = path:gsub("%?.*$", "")
   
@@ -321,7 +694,7 @@ local function handle_request(method, path)
   }
 end
 
-local function send_response(client, response)
+send_response = function(client, response)
   local body = encode_json(response.body) or "{}"
   local status_text = get_status_text(response.status)
   local response_line = "HTTP/1.1 " .. response.status .. " " .. status_text .. "\r\n"
@@ -342,11 +715,11 @@ local function send_response(client, response)
   client:send(body)
 end
 
-local function send_error(client, status, message)
+send_error = function(client, status, message)
   send_response(client, { status = status, headers = {}, body = { error = message } })
 end
 
-local function get_available_endpoints()
+get_available_endpoints = function()
   local eps = {}
   for path in pairs(MOCK_RESPONSES) do
     table.insert(eps, path)
@@ -464,6 +837,16 @@ print(CYAN .. "Lua version: " .. (_VERSION or "unknown") .. RESET)
 print(CYAN .. "Server port: " .. MOCK_SERVER_PORT .. RESET)
 print(CYAN .. "Spec path: " .. SPEC_PATH .. RESET)
 print("")
+
+local args = parse_args(arg)
+local validation_report = validate_mock_responses(SPEC_PATH, MOCK_RESPONSES)
+print_validation_report(validation_report, args.allow_invalid_mocks)
+if not validation_report.ok and not args.allow_invalid_mocks then
+  os.exit(1)
+end
+if args.validate_only then
+  os.exit(0)
+end
 
 local ok, yaml = pcall(function()
   local yaml = require("yaml")

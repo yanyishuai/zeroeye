@@ -96,6 +96,40 @@ Common error codes:
 
 ## Market Data Endpoints
 
+### OpenAPI Mock Contract Validation
+
+`tools/openapi_mock.lua` validates generated mock responses against
+`docs/openapi/v3.yaml` before the mock server starts. For each configured mock
+endpoint with an `application/json` 2xx response schema, startup checks required
+fields, basic scalar types, arrays, nested object properties, and enum values.
+
+Startup prints a validation summary with:
+
+- validated endpoint count
+- skipped endpoint count
+- skipped endpoint/status pairs that have no matching JSON response schema
+- schema violations that would make the mock response incompatible
+
+By default, any schema violation fails startup. For local development only, pass
+`--allow-invalid-mocks` to print the violations and continue anyway:
+
+```bash
+lua tools/openapi_mock.lua --allow-invalid-mocks
+```
+
+For CI or local preflight checks without starting the server:
+
+```bash
+lua tools/openapi_mock.lua --validate-mocks
+```
+
+Fixture coverage for valid and invalid mock responses lives under
+`docs/openapi/fixtures/` and is exercised by:
+
+```bash
+lua tools/test_openapi_mock_validation.lua
+```
+
 ### GET /market/instruments
 
 Returns a list of all tradeable instruments.

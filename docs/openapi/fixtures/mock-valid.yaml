@@ -1,0 +1,164 @@
+openapi: 3.1.0
+info:
+  title: Mock validation fixture
+  version: 1.0.0
+paths:
+  /auth/login:
+    post:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/authenticationResult'
+  /auth/register:
+    post:
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/authenticationResult'
+  /market/instruments:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/instrumentList'
+  /market/orderbook:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/orderBook'
+  /brew:
+    get:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/brewStatus'
+components:
+  schemas:
+    authenticationResult:
+      type: object
+      required:
+        - access_token
+        - refresh_token
+        - expires_in
+        - token_type
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+        token_type:
+          type: string
+          enum: [Bearer, Bearer-v2]
+        user:
+          type: object
+          properties:
+            id:
+              type: string
+            email:
+              type: string
+    instrumentList:
+      type: object
+      required:
+        - instruments
+        - pagination
+      properties:
+        instruments:
+          type: array
+          items:
+            type: object
+            required:
+              - id
+              - symbol
+            properties:
+              id:
+                type: string
+              symbol:
+                type: string
+              price:
+                type: number
+        pagination:
+          type: object
+          required:
+            - page
+            - per_page
+            - total
+            - total_pages
+          properties:
+            page:
+              type: integer
+            per_page:
+              type: integer
+            total:
+              type: integer
+            total_pages:
+              type: integer
+    orderBook:
+      type: object
+      required:
+        - symbol
+        - bids
+        - asks
+        - timestamp
+        - sequence
+      properties:
+        symbol:
+          type: string
+        bids:
+          type: array
+          items:
+            $ref: '#/components/schemas/orderBookLevel'
+        asks:
+          type: array
+          items:
+            $ref: '#/components/schemas/orderBookLevel'
+        timestamp:
+          type: integer
+        sequence:
+          type: integer
+    orderBookLevel:
+      type: object
+      required:
+        - price
+        - size
+        - order_count
+      properties:
+        price:
+          type: number
+        size:
+          type: number
+        order_count:
+          type: integer
+    brewStatus:
+      type: object
+      required:
+        - state
+        - temperature
+        - phase_of_moon
+        - started_at
+      properties:
+        state:
+          type: string
+        temperature:
+          type: number
+        phase_of_moon:
+          type: string
+        started_at:
+          type: string

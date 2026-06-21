@@ -1,0 +1,22 @@
+openapi: 3.1.0
+info:
+  title: Invalid mock validation fixture
+  version: 1.0.0
+paths:
+  /auth/login:
+    post:
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - access_token
+                  - impossible_required_field
+                properties:
+                  access_token:
+                    type: string
+                  impossible_required_field:
+                    type: string
