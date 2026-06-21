@@ -45,6 +45,7 @@ import java.util.logging.Logger;
 
 public class ComplianceAuditor {
     private static final Logger LOGGER = Logger.getLogger("ComplianceAuditor");
+    private static final String DEFAULT_REPORT_PATH = "compliance/ComplianceAuditor.java";
     // What the fuck is this magic number? It was in the original code
     // and I'm afraid to change it because shit will break.
     private static final int MAGIC_NUMBER_47 = 47;
@@ -279,6 +280,144 @@ public class ComplianceAuditor {
         return new ComplianceResult(true, Collections.emptyList(), "Day trading: not restricted");
     }
 
+    public static ComplianceReport buildComplianceReport(String checkType, ComplianceResult result) {
+        List<ComplianceFinding> findings = new ArrayList<>();
+        int index = 1;
+        for (String violation : result.getViolations()) {
+            findings.add(new ComplianceFinding(
+                ruleIdFor(checkType, index),
+                "error",
+                DEFAULT_REPORT_PATH,
+                violation,
+                remediationFor(checkType)
+            ));
+            index++;
+        }
+        return new ComplianceReport(checkType, result.isCompliant(), result.getSummary(), findings);
+    }
+
+    public static String formatHumanReport(String checkType, ComplianceResult result) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Compliance Report\n");
+        sb.append("=================\n");
+        sb.append("check_type: ").append(checkType).append("\n");
+        sb.append("status: ").append(result.isCompliant() ? "pass" : "fail").append("\n");
+        sb.append("summary: ").append(result.getSummary()).append("\n");
+        if (!result.getViolations().isEmpty()) {
+            sb.append("violations:\n");
+            for (String violation : result.getViolations()) {
+                sb.append("- ").append(violation).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    public static String formatJsonReport(String checkType, ComplianceResult result) {
+        return buildComplianceReport(checkType, result).toJson();
+    }
+
+    private static String ruleIdFor(String checkType, int index) {
+        String normalized = checkType == null || checkType.isBlank()
+            ? "unknown"
+            : checkType.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "_").replaceAll("^_+|_+$", "");
+        if (normalized.isEmpty()) {
+            normalized = "unknown";
+        }
+        return "compliance." + normalized + "." + index;
+    }
+
+    private static String remediationFor(String checkType) {
+        if ("KYC".equals(checkType)) {
+            return "Complete required identity checks before approving the user.";
+        }
+        if ("AML".equals(checkType)) {
+            return "Escalate the transaction for AML review before settlement.";
+        }
+        return "Review the source data and resolve the compliance violation before approving the check.";
+    }
+
+    private static String jsonString(String value) {
+        if (value == null) {
+            return "null";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"':
+                    sb.append("\\\"");
+                    break;
+                case '\\':
+                    sb.append("\\\\");
+                    break;
+                case '\b':
+                    sb.append("\\b");
+                    break;
+                case '\f':
+                    sb.append("\\f");
+                    break;
+                case '\n':
+                    sb.append("\\n");
+                    break;
+                case '\r':
+                    sb.append("\\r");
+                    break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        sb.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        sb.append(c);
+                    }
+                    break;
+            }
+        }
+        sb.append('"');
+        return sb.toString();
+    }
+
+    private static ComplianceResult fixtureResult(String fixture) {
+        if ("fail".equals(fixture)) {
+            return new ComplianceResult(
+                false,
+                Arrays.asList("User demo-user has not completed KYC", "Enhanced due diligence required"),
+                "KYC check failed: User demo-user has not completed KYC; Enhanced due diligence required"
+            );
+        }
+        if ("empty".equals(fixture)) {
+            return new ComplianceResult(true, Collections.emptyList(), "No compliance findings");
+        }
+        return new ComplianceResult(true, Collections.emptyList(), "KYC check passed");
+    }
+
+    public static void main(String[] args) {
+        boolean json = false;
+        String fixture = "pass";
+        String checkType = "KYC";
+
+        for (String arg : args) {
+            if ("--json".equals(arg)) {
+                json = true;
+            } else if (arg.startsWith("--fixture=")) {
+                fixture = arg.substring("--fixture=".length());
+            } else if (arg.startsWith("--check=")) {
+                checkType = arg.substring("--check=".length());
+            } else if ("--help".equals(arg) || "-h".equals(arg)) {
+                System.out.println("Usage: java com.tentoftrials.compliance.ComplianceAuditor [--json] [--fixture=pass|fail|empty] [--check=KYC]");
+                return;
+            } else {
+                checkType = arg;
+            }
+        }
+
+        ComplianceResult result = fixtureResult(fixture);
+        System.out.print(json ? formatJsonReport(checkType, result) : formatHumanReport(checkType, result));
+    }
+
     // ------------------------------------------------------------------
     // INNER TYPES
     // ------------------------------------------------------------------
@@ -316,6 +455,64 @@ public class ComplianceAuditor {
         public boolean isCompliant() { return compliant; }
         public Collection<String> getViolations() { return violations; }
         public String getSummary() { return summary; }
+    }
+
+    public static class ComplianceFinding {
+        private final String ruleId;
+        private final String severity;
+        private final String path;
+        private final String message;
+        private final String remediation;
+
+        public ComplianceFinding(String ruleId, String severity, String path, String message, String remediation) {
+            this.ruleId = ruleId;
+            this.severity = severity;
+            this.path = path;
+            this.message = message;
+            this.remediation = remediation;
+        }
+
+        public String toJson() {
+            return "{"
+                + "\"rule_id\":" + jsonString(ruleId)
+                + ",\"severity\":" + jsonString(severity)
+                + ",\"path\":" + jsonString(path)
+                + ",\"message\":" + jsonString(message)
+                + ",\"remediation\":" + jsonString(remediation)
+                + "}";
+        }
+    }
+
+    public static class ComplianceReport {
+        private final String checkType;
+        private final boolean compliant;
+        private final String summary;
+        private final List<ComplianceFinding> findings;
+
+        public ComplianceReport(String checkType, boolean compliant, String summary, List<ComplianceFinding> findings) {
+            this.checkType = checkType;
+            this.compliant = compliant;
+            this.summary = summary;
+            this.findings = Collections.unmodifiableList(new ArrayList<>(findings));
+        }
+
+        public String toJson() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            sb.append("\"check_type\":").append(jsonString(checkType));
+            sb.append(",\"status\":").append(jsonString(compliant ? "pass" : "fail"));
+            sb.append(",\"compliant\":").append(compliant);
+            sb.append(",\"summary\":").append(jsonString(summary));
+            sb.append(",\"findings\":[");
+            for (int i = 0; i < findings.size(); i++) {
+                if (i > 0) {
+                    sb.append(",");
+                }
+                sb.append(findings.get(i).toJson());
+            }
+            sb.append("]}");
+            return sb.toString();
+        }
     }
 
     // Fuck it. That's the end of the class.

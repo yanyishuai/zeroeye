@@ -87,6 +87,29 @@ Alerts are sent to PagerDuty and Slack (#ops-alerts channel).
 
 ## Incident Response
 
+### Compliance Auditor JSON Reports
+
+`ComplianceAuditor` keeps the existing human-readable report output by default.
+Use `--json` when CI, review tooling, or incident automation needs a stable
+machine-readable report.
+
+Example commands:
+
+```bash
+javac -d compliance/build compliance/ComplianceAuditor.java
+java -cp compliance/build com.tentoftrials.compliance.ComplianceAuditor --json --fixture=pass --check=KYC
+java -cp compliance/build com.tentoftrials.compliance.ComplianceAuditor --json --fixture=fail --check=KYC
+```
+
+The JSON report includes:
+
+- `check_type`, `status`, `compliant`, and `summary`
+- deterministic `findings` ordering
+- per-finding `rule_id`, `severity`, `path`, `message`, and `remediation`
+
+An empty result is valid JSON with `findings: []`. Human-readable output remains
+the default for operators running the auditor manually.
+
 ### Severity Levels
 
 | Level | Description | Examples | Response Time |
