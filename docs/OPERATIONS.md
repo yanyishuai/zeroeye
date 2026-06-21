@@ -15,6 +15,27 @@
 
 ## Monitoring
 
+### Bounty Issue Template Validation
+
+Before publishing or copying a bounty issue body, run the local validator
+against the Markdown draft:
+
+```sh
+python3 tools/validate_bounty_issue.py path/to/bounty-issue.md
+```
+
+For CI or automation, use JSON output:
+
+```sh
+python3 tools/validate_bounty_issue.py --json path/to/bounty-issue.md
+```
+
+The validator is read-only. It checks that the draft contains the required
+`**Bounty:**`, `Acceptance criteria:`, `Commissions:`, and
+`Required validation:` sections, that the commissions paragraph exactly matches
+the required payout text, and that the validation instructions require a real
+generated `.logd` diagnostic while excluding `build-00000000`.
+
 ### Health Check Endpoints
 
 Each service exposes a health check endpoint:
