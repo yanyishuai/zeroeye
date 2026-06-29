@@ -94,6 +94,33 @@ SUPPORTED_RESOURCE_TYPES = [
 
 REQUIRED_TERRAFORM_VERSION = ">= 1.0.0"
 
+TERRAFORM_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class TerraformResourceNameError(ValueError):
+    """Raised when a Terraform resource name is not a safe identifier."""
+
+
+def validate_resource_name(resource_type: str, resource_name: str) -> None:
+    if not resource_name:
+        raise TerraformResourceNameError(
+            f"Invalid Terraform resource name for {resource_type}: name cannot be empty"
+        )
+    if "-" in resource_name:
+        raise TerraformResourceNameError(
+            f"Invalid Terraform resource name for {resource_type}.{resource_name}: "
+            "hyphenated names are not allowed; use underscores instead"
+        )
+    if not TERRAFORM_IDENTIFIER_RE.match(resource_name):
+        raise TerraformResourceNameError(
+            f"Invalid Terraform resource name for {resource_type}.{resource_name}: "
+            "names must start with a letter or underscore and contain only letters, digits, and underscores"
+        )
+
+
+def validate_resource(resource: "ResourceToImport") -> None:
+    validate_resource_name(resource.resource_type, resource.resource_name)
+
 # ---------------------------------------------------------------------------
 # DATA MODELS
 # ---------------------------------------------------------------------------
@@ -142,6 +169,19 @@ class TerraformImporter:
             return False
 
     def import_resource(self, resource: ResourceToImport) -> bool:
+        try:
+            validate_resource(resource)
+        except TerraformResourceNameError as exc:
+            address = f"{resource.resource_type}.{resource.resource_name}"
+            logger.error(f"  ✗ {exc}")
+            self.results.append({
+                "address": address,
+                "resource_id": resource.resource_id,
+                "status": "invalid_name",
+                "error": str(exc),
+            })
+            return False
+
         address = f"{resource.resource_type}.{resource.resource_name}"
         cmd = [
             self.terraform_binary, "import",
@@ -208,6 +248,19 @@ class TerraformImporter:
         if dry_run:
             logger.info("DRY RUN - No resources will be imported")
             for resource in resources:
+                try:
+                    validate_resource(resource)
+                except TerraformResourceNameError as exc:
+                    address = f"{resource.resource_type}.{resource.resource_name}"
+                    logger.error(f"  ✗ {exc}")
+                    import_result.results.append({
+                        "address": address,
+                        "resource_id": resource.resource_id,
+                        "status": "invalid_name",
+                        "error": str(exc),
+                    })
+                    import_result.failure_count += 1
+                    continue
                 address = f"{resource.resource_type}.{resource.resource_name}"
                 logger.info(f"  Would import: {address} (ID: {resource.resource_id})")
                 import_result.results.append({
@@ -262,6 +315,10 @@ class TerraformImporter:
         lines = ["#!/bin/bash", "# Auto-generated Terraform import script", f"# Generated: {datetime.now().isoformat()}", ""]
 
         for resource in resources:
+            try:
+                validate_resource(resource)
+            except TerraformResourceNameError as exc:
+                raise TerraformResourceNameError(str(exc)) from exc
             address = f"{resource.resource_type}.{resource.resource_name}"
             lines.append(
                 f"terraform import -state={resource.state_file} {address} {resource.resource_id}"
@@ -495,12 +552,18 @@ def main():
         with open(args.csv, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                resources_to_import.append(ResourceToImport(
+                resource = ResourceToImport(
                     resource_type=row.get("type", row.get("resource_type", "")),
                     resource_name=row.get("name", row.get("resource_name", "")),
                     resource_id=row.get("id", row.get("resource_id", "")),
                     state_file=row.get("state_file", "terraform.tfstate"),
-                ))
+                )
+                try:
+                    validate_resource(resource)
+                except TerraformResourceNameError as exc:
+                    logger.error(str(exc))
+                    return 1
+                resources_to_import.append(resource)
 
         if not resources_to_import:
             logger.error("No resources found in CSV file")
