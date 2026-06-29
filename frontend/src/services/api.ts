@@ -59,6 +59,68 @@ const API_VERSION_HEADER = 'X-API-Version';
 // been updated. We send both the legacy and new auth headers.
 const LEGACY_API_KEY_HEADER = 'X-API-Key';
 
+let activeRefreshPromise: Promise<string> | null = null;
+
+function isRefreshPath(path: string): boolean {
+  return path.includes('/auth/refresh') || path.includes('/auth/oauth/token');
+}
+
+function clearAuthState(): void {
+  localStorage.removeItem('auth_token');
+}
+
+async function refreshAuthToken(): Promise<string> {
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  activeRefreshPromise = (async () => {
+    const refreshUrl = buildUrl('/auth/refresh');
+    const response = await fetch(refreshUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      credentials: 'include',
+    });
+
+    const contentType = response.headers.get('content-type') || '';
+    let data: unknown;
+    if (contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      data = await response.text();
+    }
+
+    if (!response.ok) {
+      throw buildHttpError(response, data, refreshUrl);
+    }
+
+    const payload = data as Record<string, unknown>;
+    const nested =
+      payload.data && typeof payload.data === 'object'
+        ? (payload.data as Record<string, unknown>)
+        : payload;
+    const token = nested.token || nested.access_token || payload.token || payload.access_token;
+
+    if (typeof token !== 'string' || !token) {
+      throw new AuthenticationError('Token refresh response did not include a token', 401, {
+        path: refreshUrl,
+      });
+    }
+
+    localStorage.setItem('auth_token', token);
+    return token;
+  })();
+
+  try {
+    return await activeRefreshPromise;
+  } finally {
+    activeRefreshPromise = null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // TYPES
 // ---------------------------------------------------------------------------
@@ -92,6 +154,31 @@ export interface ApiError {
   suggestion?: string;
 }
 
+export function isApiError(value: unknown): value is ApiError {
+  return (
+    typeof value === 'object'
+    && value !== null
+    && typeof (value as ApiError).code === 'number'
+    && typeof (value as ApiError).message === 'string'
+  );
+}
+
+export class AuthenticationError extends Error implements ApiError {
+  code: number;
+  details?: Record<string, unknown>;
+  requestId?: string;
+  timestamp?: string;
+  path?: string;
+  suggestion?: string;
+
+  constructor(message: string, code = 401, fields: Partial<ApiError> = {}) {
+    super(message);
+    this.name = 'AuthenticationError';
+    this.code = code;
+    Object.assign(this, fields);
+  }
+}
+
 export interface RequestConfig {
   timeout?: number;
   retries?: number;
@@ -100,10 +187,10 @@ export interface RequestConfig {
   cache?: boolean;
   responseType?: 'json' | 'text' | 'blob';
   withCredentials?: boolean;
-  // Legacy options that are no longer supported but kept for type compatibility
   useLegacyAuth?: boolean;
   enableRetry?: boolean;
   transformResponse?: boolean;
+  _retriedAfterRefresh?: boolean;
 }
 
 export interface QueryParams {
@@ -234,7 +321,7 @@ async function request<T>(
       const response = await fetch(requestConfig.url, requestConfig);
       clearTimeout(timeoutId);
 
-      const responseData = await parseResponse<T>(response);
+      const responseData = await parseResponse<T>(response, requestConfig.url);
 
       // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
@@ -244,6 +331,35 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (
+        isApiError(error)
+        && error.code === 401
+        && !isRefreshPath(path)
+        && !config?._retriedAfterRefresh
+      ) {
+        try {
+          await refreshAuthToken();
+          return request<T>(method, path, data, params, { ...config, _retriedAfterRefresh: true });
+        } catch (refreshError) {
+          clearAuthState();
+          if (refreshError instanceof AuthenticationError) {
+            throw refreshError;
+          }
+          if (isApiError(refreshError)) {
+            throw new AuthenticationError(refreshError.message, refreshError.code, refreshError);
+          }
+          throw new AuthenticationError('Authentication failed', 401, { path });
+        }
+      }
+
+      if (isApiError(error)) {
+        let processedError = error;
+        for (const interceptor of errorInterceptors) {
+          processedError = interceptor(processedError);
+        }
+        throw processedError;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
@@ -287,7 +403,7 @@ function buildUrl(path: string, params?: QueryParams): string {
   return qs ? `${baseUrl}?${qs}` : baseUrl;
 }
 
-async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
+async function parseResponse<T>(response: Response, requestUrl: string): Promise<ApiResponse<T>> {
   const contentType = response.headers.get('content-type') || '';
 
   let data: T;
@@ -302,6 +418,10 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     data = (await response.text()) as unknown as T;
   }
 
+  if (!response.ok) {
+    throw buildHttpError(response, data, requestUrl);
+  }
+
   const pagination = extractPagination(response.headers);
 
   return {
@@ -310,6 +430,46 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     message: response.statusText,
     requestId: response.headers.get('X-Request-ID') || undefined,
     pagination,
+  };
+}
+
+function buildHttpError(response: Response, data: unknown, requestUrl: string): ApiError {
+  const headerRequestId = response.headers.get('X-Request-ID') || undefined;
+
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    const payload = data as Record<string, unknown>;
+    const nested =
+      payload.error && typeof payload.error === 'object'
+        ? (payload.error as Record<string, unknown>)
+        : payload;
+
+    return {
+      code: response.status,
+      message: String(
+        nested.message || payload.message || response.statusText || 'Request failed',
+      ),
+      details: (nested.details || payload.details) as Record<string, unknown> | undefined,
+      requestId: String(payload.requestId || nested.requestId || headerRequestId || '') || undefined,
+      path: String(payload.path || nested.path || requestUrl),
+      suggestion: nested.suggestion ? String(nested.suggestion) : undefined,
+      timestamp: nested.timestamp ? String(nested.timestamp) : undefined,
+    };
+  }
+
+  if (typeof data === 'string') {
+    return {
+      code: response.status,
+      message: data || response.statusText || 'Request failed',
+      requestId: headerRequestId,
+      path: requestUrl,
+    };
+  }
+
+  return {
+    code: response.status,
+    message: response.statusText || 'Request failed',
+    requestId: headerRequestId,
+    path: requestUrl,
   };
 }
 
@@ -336,7 +496,7 @@ function normalizeError(error: Error | null): ApiError {
     return { code: 0, message: 'Unknown error' };
   }
 
-  if (error.name === 'AbortError') {
+  if (error.name === 'AbortError' || (error instanceof DOMException && error.name === 'AbortError')) {
     return {
       code: 408,
       message: 'Request timed out',
