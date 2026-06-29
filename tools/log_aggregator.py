@@ -52,6 +52,21 @@ from collections import defaultdict, Counter
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
 
+NGINX_LINE_HINT = re.compile(r"^\S+\s+\S+\s+\S+\s+\[")
+SECRET_VALUE_PATTERN = re.compile(
+    r"(password|secret|token|api[_-]?key|authorization)\s*[:=]\s*\S+",
+    re.IGNORECASE,
+)
+
+
+def sanitize_error_message(message: str, max_len: int = 160) -> str:
+    """Strip secret-looking fragments and cap length without echoing raw log payloads."""
+    cleaned = SECRET_VALUE_PATTERN.sub(r"\1=***", message.strip())
+    if len(cleaned) > max_len:
+        return cleaned[: max_len - 3] + "..."
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # LOG PARSERS
 # ---------------------------------------------------------------------------
@@ -203,9 +218,11 @@ class NginxLogParser(LogParser):
 # ---------------------------------------------------------------------------
 
 class LogAggregator:
-    def __init__(self):
+    def __init__(self, track_parse_errors: bool = False):
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
+        self.track_parse_errors = track_parse_errors
         self.entries: List[Dict[str, Any]] = []
+        self.parse_failures: List[Dict[str, Any]] = []
         self.level_counts: Counter = Counter()
         self.service_counts: Counter = Counter()
         self.hourly_counts: Counter = Counter()
@@ -213,17 +230,71 @@ class LogAggregator:
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
 
+    def _record_parse_failure(
+        self,
+        filepath: str,
+        line_number: int,
+        parser_type: str,
+        message: str,
+    ) -> None:
+        self.parse_failures.append(
+            {
+                "file": filepath,
+                "line": line_number,
+                "parser": parser_type,
+                "error": sanitize_error_message(message),
+            }
+        )
+
+    def _inspect_parse_failures(self, filepath: str, line_number: int, line: str) -> None:
+        if not self.track_parse_errors:
+            return
+
+        stripped = line.strip()
+        if not stripped:
+            return
+
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                self._record_parse_failure(
+                    filepath,
+                    line_number,
+                    "json",
+                    f"JSON decode error: {exc.msg}",
+                )
+            else:
+                if not isinstance(parsed, dict):
+                    self._record_parse_failure(
+                        filepath,
+                        line_number,
+                        "json",
+                        "JSON value is not an object",
+                    )
+            return
+
+        if NGINX_LINE_HINT.match(stripped) and NginxLogParser().parse(line) is None:
+            self._record_parse_failure(
+                filepath,
+                line_number,
+                "nginx",
+                "Line does not match nginx access log format",
+            )
+
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
         try:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
-                    for line in f:
+                    for line_number, line in enumerate(f, start=1):
+                        self._inspect_parse_failures(filepath, line_number, line)
                         if self._parse_line(line):
                             parsed_count += 1
             else:
                 with open(filepath, 'r', errors='replace') as f:
-                    for line in f:
+                    for line_number, line in enumerate(f, start=1):
+                        self._inspect_parse_failures(filepath, line_number, line)
                         if self._parse_line(line):
                             parsed_count += 1
         except Exception as e:
@@ -403,6 +474,32 @@ th {{ background: #1e293b; color: #94a3b8; }}
             f.write(html)
         logger.info(f"HTML report generated at {output_path}")
 
+    def export_parse_error_report(self, output_path: str) -> None:
+        by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for failure in self.parse_failures:
+            by_file[failure["file"]].append(
+                {
+                    "line": failure["line"],
+                    "parser": failure["parser"],
+                    "error": failure["error"],
+                }
+            )
+
+        report = {
+            "total_failures": len(self.parse_failures),
+            "files": [
+                {
+                    "file": filepath,
+                    "failure_count": len(failures),
+                    "failures": failures,
+                }
+                for filepath, failures in sorted(by_file.items())
+            ],
+        }
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        logger.info(f"Parse error report written to {output_path}")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Log aggregator and analysis tool")
@@ -411,6 +508,10 @@ def parse_args():
     parser.add_argument("--output", "-o", default="log_report.json", help="Output file path")
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
+    parser.add_argument(
+        "--parse-error-report",
+        help="Write a JSON summary of parse failures (file, line, parser, sanitized error)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -420,7 +521,7 @@ def main():
     if args.verbose:
         logger.setLevel(logging.DEBUG)
 
-    aggregator = LogAggregator()
+    aggregator = LogAggregator(track_parse_errors=bool(args.parse_error_report))
 
     if args.input:
         if '*' in args.input or '?' in args.input:
@@ -458,6 +559,9 @@ def main():
         aggregator.generate_html_report(args.output)
     else:
         aggregator.export_json(args.output)
+
+    if args.parse_error_report:
+        aggregator.export_parse_error_report(args.parse_error_report)
 
     return 0
 
