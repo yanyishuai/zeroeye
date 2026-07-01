@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -197,11 +198,39 @@ def check_alertmanager(url: str) -> bool:
     return False
 
 
+def find_self_dividing_expressions(rules: List[Dict[str, Any]]) -> List[str]:
+    """Detect alert expressions that divide a metric by itself."""
+    problems: List[str] = []
+    pattern = re.compile(
+        r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*/\s*\1(?:\s*[><=]|$)",
+    )
+    for rule in rules:
+        expr = rule.get("expr", "")
+        if pattern.search(expr):
+            problems.append(f"{rule.get('name', 'unknown')}: {expr}")
+    return problems
+
+
+def validate_alert_rules(rules: List[Dict[str, Any]]) -> List[str]:
+    problems = find_self_dividing_expressions(rules)
+    for rule in rules:
+        expr = rule.get("expr", "")
+        if not expr.strip():
+            problems.append(f"{rule.get('name', 'unknown')}: empty expression")
+    return problems
+
+
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
+
+    validation_errors = validate_alert_rules(rules)
+    if validation_errors:
+        for error in validation_errors:
+            print(f"Invalid alert rule: {error}", file=sys.stderr)
+        return False
 
     yaml_content = ["groups:", "  - name: tent_alerts", "    interval: 30s", "    rules:"]
     for rule in rules:
@@ -429,6 +458,12 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        alert_errors = validate_alert_rules(RECOMMENDED_ALERT_RULES)
+        if alert_errors:
+            for error in alert_errors:
+                print(f"  alert rule: {error}")
+            return 1
+        print(f"  alert rules: OK ({len(RECOMMENDED_ALERT_RULES)} checked)")
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
